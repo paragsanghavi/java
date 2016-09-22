@@ -2,13 +2,12 @@ package com.wavefront.agent;
 
 import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicate;
 import com.google.common.base.Splitter;
 
 import com.beust.jcommander.internal.Lists;
 import com.wavefront.agent.formatter.GraphiteFormatter;
+import com.wavefront.agent.logsharvesting.FilebeatListener;
 import com.wavefront.api.agent.AgentConfiguration;
-import com.wavefront.ingester.Decoder;
 import com.wavefront.ingester.GraphiteDecoder;
 import com.wavefront.ingester.GraphiteHostAnnotator;
 import com.wavefront.ingester.OpenTSDBDecoder;
@@ -20,6 +19,7 @@ import com.wavefront.ingester.TcpIngester;
 import org.glassfish.jersey.jackson.JacksonFeature;
 import org.glassfish.jersey.jetty.JettyHttpContainerFactory;
 import org.glassfish.jersey.server.ResourceConfig;
+import org.logstash.beats.Server;
 
 import java.io.IOException;
 import java.net.URI;
@@ -145,6 +145,20 @@ public class PushAgent extends AbstractAgent {
         }
       }
     }
+
+    if (filebeatPort != null) {
+      final Server filebeatServer = new Server(filebeatPort);
+      filebeatServer.setMessageListener(new FilebeatListener(
+          new PointHandlerImpl(filebeatPort, pushValidationLevel, pushBlockedSamples, getFlushTasks(filebeatPort)),
+          logsIngestionConfig, hostname, prefix, true));
+      startAsManagedThread(() -> {
+        try {
+          filebeatServer.listen();
+        } catch (InterruptedException e) {
+          e.printStackTrace();
+        }
+      });
+    }
   }
 
   protected void startOpenTsdbListener(String strPort) {
@@ -192,23 +206,6 @@ public class PushAgent extends AbstractAgent {
 
     startAsManagedThread(new StreamIngester(new FrameDecoderFactoryImpl(), handler, port)
         .withChildChannelOptions(childChannelOptions));
-  }
-
-  /**
-   * Registers a custom point handler on a particular port.
-   *
-   * @param strPort       The port to listen on.
-   * @param decoder       The decoder to use.
-   * @param pointHandler  The handler to handle parsed ReportPoints.
-   * @param linePredicate Predicate to reject lines. See {@link com.wavefront.common.MetricWhiteBlackList}
-   * @param formatter     Transform function for each line.
-   */
-  protected void startCustomListener(String strPort, Decoder<String> decoder, PointHandler pointHandler,
-                                     Predicate<String> linePredicate,
-                                     @Nullable Function<String, String> formatter) {
-    int port = Integer.parseInt(strPort);
-    ChannelHandler channelHandler = new ChannelStringHandler(decoder, pointHandler, linePredicate, formatter);
-    startAsManagedThread(new StringLineIngester(channelHandler, port).withChildChannelOptions(childChannelOptions));
   }
 
   protected void startGraphiteListener(String strPort,

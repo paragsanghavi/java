@@ -11,6 +11,9 @@ import com.google.gson.Gson;
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.wavefront.agent.config.LogsIngestionConfig;
 import com.wavefront.api.AgentAPI;
 import com.wavefront.api.agent.AgentConfiguration;
 import com.wavefront.common.Clock;
@@ -24,6 +27,7 @@ import org.apache.http.client.config.RequestConfig;
 import org.apache.http.config.SocketConfig;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.client.SystemDefaultCredentialsProvider;
 import org.jboss.resteasy.client.jaxrs.ClientHttpEngine;
 import org.jboss.resteasy.client.jaxrs.ResteasyClient;
 import org.jboss.resteasy.client.jaxrs.ResteasyClientBuilder;
@@ -167,6 +171,9 @@ public abstract class AbstractAgent {
       "data. Binds, by default, to none.")
   protected String writeHttpJsonPorts = "";
 
+  @Parameter(names = {"--filebeatPort"}, description = "Port on which to listen for filebeat data.")
+  protected Integer filebeatPort = null;
+
   @Parameter(names = {"--hostname"}, description = "Hostname for the agent. Defaults to FQDN of machine.")
   protected String hostname;
 
@@ -232,6 +239,9 @@ public abstract class AbstractAgent {
   @Parameter(names = {"--proxyPassword"}, description = "If proxy authentication is necessary, this is the password that will be passed along")
   protected String proxyPassword = null;
 
+  @Parameter(names = {"--logsIngestionConfigFile"}, description = "Location of logs ingestions config yaml file.")
+  protected String logsIngestionConfigFile = null;
+
   @Parameter(description = "Unparsed parameters")
   protected List<String> unparsed_params;
 
@@ -244,6 +254,8 @@ public abstract class AbstractAgent {
 
   protected final boolean localAgent;
   protected final boolean pushAgent;
+
+  protected LogsIngestionConfig logsIngestionConfig;
 
   /**
    * Executors for support tasks.
@@ -285,6 +297,14 @@ public abstract class AbstractAgent {
   protected abstract void startListeners();
 
   protected abstract void stopListeners();
+
+  private void loadLogsIngestionConfig() throws IOException {
+    if (logsIngestionConfigFile == null) {
+      return;
+    }
+    ObjectMapper objectMapper = new ObjectMapper(new YAMLFactory());
+    logsIngestionConfig = objectMapper.readValue(new File(logsIngestionConfigFile), LogsIngestionConfig.class);
+  }
 
   private void loadListenerConfigurationFile() throws IOException {
     // If they've specified a push configuration file, override the command line values
@@ -336,6 +356,8 @@ public abstract class AbstractAgent {
         ephemeral = Boolean.parseBoolean(prop.getProperty("ephemeral", String.valueOf(ephemeral)));
         picklePorts = prop.getProperty("picklePorts", picklePorts);
         bufferFile = prop.getProperty("buffer", bufferFile);
+        filebeatPort = Integer.parseInt(prop.getProperty("filebeatPort", String.valueOf(filebeatPort)));
+        logsIngestionConfigFile = prop.getProperty("logsIngestionConfigFile", logsIngestionConfigFile);
         logger.warning("Loaded configuration file " + pushConfigFile);
       } catch (Throwable exception) {
         logger.severe("Could not load configuration file " + pushConfigFile);
@@ -374,8 +396,9 @@ public abstract class AbstractAgent {
        * Configuration Setup.
        * ------------------------------------------------------------------------------------ */
 
-      // 1. Load the listener configuration, if it exists
+      // 1. Load the listener configurations.
       loadListenerConfigurationFile();
+      loadLogsIngestionConfig();
 
       // 2. Read or create the unique Id for the daemon running on this machine.
       readOrCreateDaemonId();
@@ -695,7 +718,7 @@ public abstract class AbstractAgent {
     logger.info("Shutdown complete");
   }
 
-  private String getLocalHostName() {
+  private static String getLocalHostName() {
     try {
       return InetAddress.getLocalHost().getCanonicalHostName();
     } catch (UnknownHostException e) {

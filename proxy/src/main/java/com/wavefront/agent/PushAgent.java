@@ -6,6 +6,7 @@ import com.google.common.base.Splitter;
 
 import com.beust.jcommander.internal.Lists;
 import com.wavefront.agent.formatter.GraphiteFormatter;
+import com.wavefront.agent.logsharvesting.FilebeatListener;
 import com.wavefront.agent.preprocessor.PointPreprocessor;
 import com.wavefront.agent.preprocessor.ReportPointAddPrefixTransformer;
 import com.wavefront.agent.preprocessor.ReportPointTimestampInRangeFilter;
@@ -22,6 +23,7 @@ import com.wavefront.ingester.TcpIngester;
 import org.glassfish.jersey.jackson.JacksonFeature;
 import org.glassfish.jersey.jetty.JettyHttpContainerFactory;
 import org.glassfish.jersey.server.ResourceConfig;
+import org.logstash.beats.Server;
 
 import java.io.IOException;
 import java.net.URI;
@@ -152,6 +154,20 @@ public class PushAgent extends AbstractAgent {
         }
       }
     }
+
+    if (filebeatPort != null) {
+      final Server filebeatServer = new Server(filebeatPort);
+      filebeatServer.setMessageListener(new FilebeatListener(
+          new PointHandlerImpl(filebeatPort, pushValidationLevel, pushBlockedSamples, getFlushTasks(filebeatPort)),
+          logsIngestionConfig, hostname, prefix, true));
+      startAsManagedThread(() -> {
+        try {
+          filebeatServer.listen();
+        } catch (InterruptedException e) {
+          e.printStackTrace();
+        }
+      });
+    }
   }
 
   protected void startOpenTsdbListener(final String strPort) {
@@ -213,10 +229,10 @@ public class PushAgent extends AbstractAgent {
   /**
    * Registers a custom point handler on a particular port.
    *
-   * @param strPort       The port to listen on.
-   * @param decoder       The decoder to use.
-   * @param pointHandler  The handler to handle parsed ReportPoints.
-   * @param preprocessor  Pre-processor (predicates and transform functions) for every point
+   * @param strPort      The port to listen on.
+   * @param decoder      The decoder to use.
+   * @param pointHandler The handler to handle parsed ReportPoints.
+   * @param preprocessor Pre-processor (predicates and transform functions) for every point
    */
   protected void startCustomListener(String strPort, Decoder<String> decoder, PointHandler pointHandler,
                                      @Nullable PointPreprocessor preprocessor) {
@@ -226,86 +242,86 @@ public class PushAgent extends AbstractAgent {
   }
 
   protected void startGraphiteListener(String strPort, boolean withCustomFormatter) {
-    int port = Integer.parseInt(strPort);
+      int port = Integer.parseInt(strPort);
 
-    if (prefix != null && !prefix.isEmpty()) {
-      preprocessors.forPort(strPort).forReportPoint().addTransformer(new ReportPointAddPrefixTransformer(prefix));
-    }
-    preprocessors.forPort(strPort).forReportPoint()
-        .addFilter(new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours));
-    // Set up a custom graphite handler, with no formatter
-    ChannelHandler graphiteHandler = new ChannelStringHandler(
-        new GraphiteDecoder("unknown", customSourceTags),
-        new PointHandlerImpl(port, pushValidationLevel, pushBlockedSamples, getFlushTasks(port)),
-        preprocessors.forPort(strPort));
-
-    if (!withCustomFormatter) {
-      List<Function<Channel, ChannelHandler>> handler = Lists.newArrayList(1);
-      handler.add(new Function<Channel, ChannelHandler>() {
-        @Override
-        public ChannelHandler apply(Channel input) {
-          SocketChannel ch = (SocketChannel) input;
-          return new GraphiteHostAnnotator(ch.remoteAddress().getHostName(), customSourceTags);
-        }
-      });
-      startAsManagedThread(new StringLineIngester(handler, graphiteHandler, port)
-          .withChildChannelOptions(childChannelOptions));
-    } else {
-      startAsManagedThread(new StringLineIngester(graphiteHandler, port)
-          .withChildChannelOptions(childChannelOptions));
-    }
-  }
-
-  /**
-   * Push agent configuration during check-in by the collector.
-   *
-   * @param config The configuration to process.
-   */
-  @Override
-  protected void processConfiguration(AgentConfiguration config) {
-    try {
-      agentAPI.agentConfigProcessed(agentId);
-      Long pointsPerBatch = config.getPointsPerBatch();
-      if (config.getCollectorSetsPointsPerBatch() != null &&
-          config.getCollectorSetsPointsPerBatch()) {
-        if (pointsPerBatch != null) {
-          // if the collector is in charge and it provided a setting, use it
-          QueuedAgentService.setSplitBatchSize(pointsPerBatch.intValue());
-          PostPushDataTimedTask.setPointsPerBatch(pointsPerBatch.intValue());
-          if (pushLogLevel.equals("DETAILED")) {
-            logger.info("Agent push batch set to (remotely) " + pointsPerBatch);
-          }
-        } // otherwise don't change the setting
-      } else {
-        // restores the agent setting
-        QueuedAgentService.setSplitBatchSize(pushFlushMaxPoints);
-        PostPushDataTimedTask.setPointsPerBatch(pushFlushMaxPoints);
-        if (pushLogLevel.equals("DETAILED")) {
-          logger.info("Agent push batch set to (locally) " + pushFlushMaxPoints);
-        }
+      if (prefix != null && !prefix.isEmpty()) {
+        preprocessors.forPort(strPort).forReportPoint().addTransformer(new ReportPointAddPrefixTransformer(prefix));
       }
+      preprocessors.forPort(strPort).forReportPoint()
+          .addFilter(new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours));
+      // Set up a custom graphite handler, with no formatter
+      ChannelHandler graphiteHandler = new ChannelStringHandler(
+          new GraphiteDecoder("unknown", customSourceTags),
+          new PointHandlerImpl(port, pushValidationLevel, pushBlockedSamples, getFlushTasks(port)),
+          preprocessors.forPort(strPort));
 
-      if (config.getCollectorSetsRetryBackoff() != null &&
-          config.getCollectorSetsRetryBackoff()) {
-        if (config.getRetryBackoffBaseSeconds() != null) {
-          // if the collector is in charge and it provided a setting, use it
-          QueuedAgentService.setRetryBackoffBaseSeconds(config.getRetryBackoffBaseSeconds());
-          if (pushLogLevel.equals("DETAILED")) {
-            logger.info("Agent backoff base set to (remotely) " +
-                config.getRetryBackoffBaseSeconds());
+      if (!withCustomFormatter) {
+        List<Function<Channel, ChannelHandler>> handler = Lists.newArrayList(1);
+        handler.add(new Function<Channel, ChannelHandler>() {
+          @Override
+          public ChannelHandler apply(Channel input) {
+            SocketChannel ch = (SocketChannel) input;
+            return new GraphiteHostAnnotator(ch.remoteAddress().getHostName(), customSourceTags);
           }
-        } // otherwise don't change the setting
+        });
+        startAsManagedThread(new StringLineIngester(handler, graphiteHandler, port)
+            .withChildChannelOptions(childChannelOptions));
       } else {
-        // restores the agent setting
-        QueuedAgentService.setRetryBackoffBaseSeconds(retryBackoffBaseSeconds);
-        if (pushLogLevel.equals("DETAILED")) {
-          logger.info("Agent backoff base set to (locally) " + retryBackoffBaseSeconds);
-        }
+        startAsManagedThread(new StringLineIngester(graphiteHandler, port)
+            .withChildChannelOptions(childChannelOptions));
       }
-    } catch (RuntimeException e) {
-      // cannot throw or else configuration update thread would die.
     }
-  }
+
+    /**
+     * Push agent configuration during check-in by the collector.
+     *
+     * @param config The configuration to process.
+     */
+    @Override
+    protected void processConfiguration (AgentConfiguration config){
+      try {
+        agentAPI.agentConfigProcessed(agentId);
+        Long pointsPerBatch = config.getPointsPerBatch();
+        if (config.getCollectorSetsPointsPerBatch() != null &&
+            config.getCollectorSetsPointsPerBatch()) {
+          if (pointsPerBatch != null) {
+            // if the collector is in charge and it provided a setting, use it
+            QueuedAgentService.setSplitBatchSize(pointsPerBatch.intValue());
+            PostPushDataTimedTask.setPointsPerBatch(pointsPerBatch.intValue());
+            if (pushLogLevel.equals("DETAILED")) {
+              logger.info("Agent push batch set to (remotely) " + pointsPerBatch);
+            }
+          } // otherwise don't change the setting
+        } else {
+          // restores the agent setting
+          QueuedAgentService.setSplitBatchSize(pushFlushMaxPoints);
+          PostPushDataTimedTask.setPointsPerBatch(pushFlushMaxPoints);
+          if (pushLogLevel.equals("DETAILED")) {
+            logger.info("Agent push batch set to (locally) " + pushFlushMaxPoints);
+          }
+        }
+
+        if (config.getCollectorSetsRetryBackoff() != null &&
+            config.getCollectorSetsRetryBackoff()) {
+          if (config.getRetryBackoffBaseSeconds() != null) {
+            // if the collector is in charge and it provided a setting, use it
+            QueuedAgentService.setRetryBackoffBaseSeconds(config.getRetryBackoffBaseSeconds());
+            if (pushLogLevel.equals("DETAILED")) {
+              logger.info("Agent backoff base set to (remotely) " +
+                  config.getRetryBackoffBaseSeconds());
+            }
+          } // otherwise don't change the setting
+        } else {
+          // restores the agent setting
+          QueuedAgentService.setRetryBackoffBaseSeconds(retryBackoffBaseSeconds);
+          if (pushLogLevel.equals("DETAILED")) {
+            logger.info("Agent backoff base set to (locally) " + retryBackoffBaseSeconds);
+          }
+        }
+      } catch (RuntimeException e) {
+        // cannot throw or else configuration update thread would die.
+      }
+    }
 
   protected void startAsManagedThread(Runnable target) {
     Thread thread = new Thread(target);

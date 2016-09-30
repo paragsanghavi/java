@@ -46,8 +46,10 @@ public class Server {
     public Server(int p, int timeout) {
         port = p;
         clientInactivityTimeoutSeconds = timeout;
-        bossGroup = new NioEventLoopGroup();
-        workGroup = new NioEventLoopGroup();
+        bossGroup = new NioEventLoopGroup(10);
+        //bossGroup.setIoRatio(10);
+        workGroup = new NioEventLoopGroup(50);
+        //workGroup.setIoRatio(10);
     }
 
     public void enableSSL(SslSimpleBuilder builder) {

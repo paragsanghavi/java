@@ -1,6 +1,10 @@
 # Wavefront Proxy
 
+<<<<<<< HEAD
 The Wavefront proxy is a light-weight Java application that you send your metrics to. It handles authentication and the transmission of your metrics to your Wavefront instance.
+
+Source code under org.logstash.* is used from
+ [logstash-input-beats](https://github.com/logstash-plugins/logstash-input-beats) via the Apache 2.0 license.
 
 ## Installation
 
@@ -25,4 +29,3 @@ mvn install
 ## Configuration
 
 For the detailed list of configuration options, please refer to [Wavefront Production Proxy Configuration Guide](https://community.wavefront.com/docs/DOC-1034) on our Community site.
-

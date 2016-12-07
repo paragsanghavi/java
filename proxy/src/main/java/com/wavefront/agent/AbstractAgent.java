@@ -5,7 +5,9 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
+import com.google.common.collect.Iterables;
 import com.google.common.io.Files;
+import com.google.common.util.concurrent.RecyclableRateLimiter;
 import com.google.gson.Gson;
 
 import com.beust.jcommander.JCommander;
@@ -48,13 +50,13 @@ import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
 import java.net.Authenticator;
+import java.net.ConnectException;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.PasswordAuthentication;
 import java.net.SocketException;
-import java.net.URI;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Enumeration;
@@ -73,6 +75,9 @@ import java.util.logging.Logger;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.HttpsURLConnection;
+import javax.ws.rs.ClientErrorException;
+import javax.ws.rs.NotAuthorizedException;
+import javax.ws.rs.ProcessingException;
 
 /**
  * Agent that runs remotely on a server collecting metrics.
@@ -122,12 +127,12 @@ public abstract class AbstractAgent {
   @Parameter(names = {"--retryThreads"}, description = "Number of threads retrying failed transmissions. Defaults to " +
       "the number of processors (min. 4). Buffer files are maxed out at 2G each so increasing the number of retry " +
       "threads effectively governs the maximum amount of space the agent will use to buffer points locally")
-  protected int retryThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
+  protected int retryThreads = Math.min(16, Math.max(4, Runtime.getRuntime().availableProcessors()));
 
   @Parameter(names = {"--flushThreads"}, description = "Number of threads that flush data to the server. Defaults to" +
       "the number of processors (min. 4). Setting this value too large will result in sending batches that are too " +
       "small to the server and wasting connections. This setting is per listening port.")
-  protected int flushThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
+  protected int flushThreads = Math.min(16, Math.max(4, Runtime.getRuntime().availableProcessors()));
 
   @Parameter(names = {"--purgeBuffer"}, description = "Whether to purge the retry buffer on start-up. Defaults to " +
       "false.")
@@ -139,6 +144,16 @@ public abstract class AbstractAgent {
   @Parameter(names = {"--pushFlushMaxPoints"}, description = "Maximum allowed points in a single push flush. Defaults" +
       " to 50,000")
   protected int pushFlushMaxPoints = 50000;
+
+  @Parameter(names = {"--pushRateLimit"}, description = "Limit the outgoing point rate at the proxy. Default: " +
+      "do not throttle.")
+  protected int pushRateLimit = -1;
+
+  @Parameter(names = {"--pushMemoryBufferLimit"}, description = "Max number of points that can stay in memory buffers" +
+      " before spooling to disk. Defaults to 16 * pushFlushMaxPoints, minimum size: pushFlushMaxPoints. Setting this " +
+      " value lower than default reduces memory usage but will force the proxy to spool to disk more frequently if " +
+      " you have points arriving at the proxy in short bursts")
+  protected int pushMemoryBufferLimit = 16 * pushFlushMaxPoints;
 
   @Parameter(names = {"--pushBlockedSamples"}, description = "Max number of blocked samples to print to log. Defaults" +
       " to 0.")
@@ -155,7 +170,7 @@ public abstract class AbstractAgent {
 
   @Parameter(
       names = {"--histogramAccumulatorResolveInterval"},
-      description = "Directory for persistent agent state, must be writable.")
+      description = "Interval to write-back accumulation changes to disk in millis.")
   protected long histogramAccumulatorResolveInterval = 100;
 
   @Parameter(
@@ -169,9 +184,9 @@ public abstract class AbstractAgent {
   protected int histogramMinuteAccumulators = Runtime.getRuntime().availableProcessors();
 
   @Parameter(
-      names = {"--histogramMinuteAccumulationInterval"},
+      names = {"--histogramMinuteFlushSecs"},
       description = "Number of seconds to keep a minute granularity accumulator open for new samples.")
-  protected int histogramMinuteAccumulationInterval = 30;
+  protected int histogramMinuteFlushSecs = 70;
 
   @Parameter(
       names = {"--histogramHoursListenerPorts"},
@@ -184,9 +199,9 @@ public abstract class AbstractAgent {
   protected int histogramHourAccumulators = Runtime.getRuntime().availableProcessors();
 
   @Parameter(
-      names = {"--histogramHourAccumulationInterval"},
+      names = {"--histogramHourFlushSecs"},
       description = "Number of seconds to keep an hour granularity accumulator open for new samples.")
-  protected int histogramHourAccumulationInterval = 600;
+  protected int histogramHourFlushSecs = 4200;
 
   @Parameter(
       names = {"--histogramDaysListenerPorts"},
@@ -199,9 +214,9 @@ public abstract class AbstractAgent {
   protected int histogramDayAccumulators = Runtime.getRuntime().availableProcessors();
 
   @Parameter(
-      names = {"--histogramDayAccumulationInterval"},
+      names = {"--histogramDayFlushSecs"},
       description = "Number of seconds to keep a day granularity accumulator open for new samples.")
-  protected int histogramDayAccumulationInterval = 3600;
+  protected int histogramDayFlushSecs = 18000;
 
   @Parameter(
       names = {"--histogramDistListenerPorts"},
@@ -214,26 +229,35 @@ public abstract class AbstractAgent {
   protected int histogramDistAccumulators = Runtime.getRuntime().availableProcessors();
 
   @Parameter(
-      names = {"--histogramDistAccumulationInterval"},
+      names = {"--histogramDistFlushSecs"},
       description = "Number of seconds to keep a new distribution bin open for new samples.")
-  protected int histogramDistAccumulationInterval = 30;
+  protected int histogramDistFlushSecs = 70;
 
   @Parameter(
       names = {"--histogramAccumulatorSize"},
-      description = "Average number of bytes in a [UTF-8] encoded histogram key. Generally corresponds to a metric, " +
-          "source and tags concatenation.")
+      description = "Expected upper bound of concurrent accumulations, ~ #timeseries * #parallel reporting bins")
   protected long histogramAccumulatorSize = 100000L;
 
   @Parameter(
       names = {"--avgHistogramKeyBytes"},
       description = "Average number of bytes in a [UTF-8] encoded histogram key. Generally corresponds to a metric, " +
           "source and tags concatenation.")
-  protected int avgHistogramKeyBytes = 200;
+  protected int avgHistogramKeyBytes = 50;
 
   @Parameter(
       names = {"--avgHistogramDigestBytes"},
       description = "Average number of bytes in a encoded histogram.")
-  protected int avgHistogramDigestBytes = 1000;
+  protected int avgHistogramDigestBytes = 500;
+
+  @Parameter(
+      names = {"--persistMessages"},
+      description = "Whether histogram samples or distributions should be persisted to disk")
+  protected boolean persistMessages = true;
+
+  @Parameter(
+      names = {"--persistAccumulator"},
+      description = "Whether the accumulator should persist to disk")
+  protected boolean persistAccumulator = true;
 
   @Parameter(
       names = {"--histogramCompression"},
@@ -265,6 +289,9 @@ public abstract class AbstractAgent {
 
   @Parameter(names = {"--filebeatPort"}, description = "Port on which to listen for filebeat data.")
   protected Integer filebeatPort = 0;
+
+  @Parameter(names = {"--rawLogsPort"}, description = "Port on which to listen for raw logs data.")
+  protected Integer rawLogsPort = 0;
 
   @Parameter(names = {"--hostname"}, description = "Hostname for the agent. Defaults to FQDN of machine.")
   protected String hostname;
@@ -337,8 +364,8 @@ public abstract class AbstractAgent {
   @Parameter(names = {"--httpConnectTimeout"}, description = "Connect timeout in milliseconds (default: 5000)")
   protected int httpConnectTimeout = 5000;
 
-  @Parameter(names = {"--httpRequestTimeout"}, description = "Request timeout in milliseconds (default: 60000)")
-  protected int httpRequestTimeout = 60000;
+  @Parameter(names = {"--httpRequestTimeout"}, description = "Request timeout in milliseconds (default: 20000)")
+  protected int httpRequestTimeout = 20000;
 
   @Parameter(names = {"--preprocessorConfigFile"}, description = "Optional YAML file with additional configuration options for filtering and pre-processing points")
   protected String preprocessorConfigFile = null;
@@ -357,8 +384,8 @@ public abstract class AbstractAgent {
   protected final AtomicLong bufferSpaceLeft = new AtomicLong();
   protected List<String> customSourceTags = new ArrayList<>();
   protected final List<PostPushDataTimedTask> managedTasks = new ArrayList<>();
-  protected final List<ScheduledExecutorService> managedExecutors = new ArrayList<>();
   protected final AgentPreprocessorConfiguration preprocessors = new AgentPreprocessorConfiguration();
+  protected RecyclableRateLimiter pushRateLimiter = null;
 
   protected final ScheduledExecutorService histogramExecutor =
       Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors());
@@ -374,13 +401,19 @@ public abstract class AbstractAgent {
   private final Runnable updateConfiguration = new Runnable() {
     @Override
     public void run() {
+      long startTime = System.currentTimeMillis();
+      boolean isRetry = false;
       try {
         AgentConfiguration config = fetchConfig();
         if (config != null) {
           processConfiguration(config);
+        } else {
+          isRetry = true;
         }
       } finally {
-        auxiliaryExecutor.schedule(this, 60, TimeUnit.SECONDS);
+        // schedule the next run in 1 minute, compensated for the time taken to check in. if failed, retry in 500ms
+        long nextRun = isRetry ? 500 : Math.max(5000, 60000 - (System.currentTimeMillis() - startTime));
+        auxiliaryExecutor.schedule(this, nextRun, TimeUnit.MILLISECONDS);
       }
     }
   };
@@ -490,6 +523,7 @@ public abstract class AbstractAgent {
             String.valueOf(pushFlushInterval)));
         pushFlushMaxPoints = Integer.parseInt(prop.getProperty("pushFlushMaxPoints",
             String.valueOf(pushFlushMaxPoints)));
+        pushRateLimit = Integer.parseInt(prop.getProperty("pushRateLimit", String.valueOf(pushRateLimit)));
         pushBlockedSamples = Integer.parseInt(prop.getProperty("pushBlockedSamples",
             String.valueOf(pushBlockedSamples)));
         pushListenerPorts = prop.getProperty("pushListenerPorts", pushListenerPorts);
@@ -501,30 +535,30 @@ public abstract class AbstractAgent {
         histogramMinuteAccumulators = Integer.parseInt(prop.getProperty(
             "histogramMinuteAccumulators",
             String.valueOf(histogramMinuteAccumulators)));
-        histogramMinuteAccumulationInterval = Integer.parseInt(prop.getProperty(
-            "histogramMinuteAccumulationInterval",
-            String.valueOf(histogramMinuteAccumulationInterval)));
+        histogramMinuteFlushSecs = Integer.parseInt(prop.getProperty(
+            "histogramMinuteFlushSecs",
+            String.valueOf(histogramMinuteFlushSecs)));
         histogramHoursListenerPorts = prop.getProperty("histogramHoursListenerPorts", histogramHoursListenerPorts);
         histogramHourAccumulators = Integer.parseInt(prop.getProperty(
             "histogramHourAccumulators",
             String.valueOf(histogramHourAccumulators)));
-        histogramHourAccumulationInterval = Integer.parseInt(prop.getProperty(
-            "histogramHourAccumulationInterval",
-            String.valueOf(histogramHourAccumulationInterval)));
+        histogramHourFlushSecs = Integer.parseInt(prop.getProperty(
+            "histogramHourFlushSecs",
+            String.valueOf(histogramHourFlushSecs)));
         histogramDaysListenerPorts = prop.getProperty("histogramDaysListenerPorts", histogramDaysListenerPorts);
         histogramDayAccumulators = Integer.parseInt(prop.getProperty(
             "histogramDayAccumulators",
             String.valueOf(histogramDayAccumulators)));
-        histogramDayAccumulationInterval = Integer.parseInt(prop.getProperty(
-            "histogramDayAccumulationInterval",
-            String.valueOf(histogramDayAccumulationInterval)));
+        histogramDayFlushSecs = Integer.parseInt(prop.getProperty(
+            "histogramDayFlushSecs",
+            String.valueOf(histogramDayFlushSecs)));
         histogramDistListenerPorts = prop.getProperty("histogramDistListenerPorts", histogramDistListenerPorts);
         histogramDistAccumulators = Integer.parseInt(prop.getProperty(
             "histogramDistAccumulators",
             String.valueOf(histogramDistAccumulators)));
-        histogramDistAccumulationInterval = Integer.parseInt(prop.getProperty(
-            "histogramDistAccumulationInterval",
-            String.valueOf(histogramDistAccumulationInterval)));
+        histogramDistFlushSecs = Integer.parseInt(prop.getProperty(
+            "histogramDistFlushSecs",
+            String.valueOf(histogramDistFlushSecs)));
         histogramAccumulatorSize = Long.parseLong(prop.getProperty(
             "histogramAccumulatorSize",
             String.valueOf(histogramAccumulatorSize)));
@@ -537,6 +571,10 @@ public abstract class AbstractAgent {
         histogramCompression = Short.parseShort(prop.getProperty(
             "histogramCompression",
             String.valueOf(histogramCompression)));
+        persistAccumulator =
+            Boolean.parseBoolean(prop.getProperty("persistAccumulator", String.valueOf(persistAccumulator)));
+        persistMessages =
+            Boolean.parseBoolean(prop.getProperty("persistMessages", String.valueOf(persistMessages)));
 
         retryThreads = Integer.parseInt(prop.getProperty("retryThreads", String.valueOf(retryThreads)));
         flushThreads = Integer.parseInt(prop.getProperty("flushThreads", String.valueOf(flushThreads)));
@@ -579,7 +617,23 @@ public abstract class AbstractAgent {
         dataBackfillCutoffHours = Integer.parseInt(prop.getProperty("dataBackfillCutoffHours",
             String.valueOf(dataBackfillCutoffHours)));
         filebeatPort = Integer.parseInt(prop.getProperty("filebeatPort", String.valueOf(filebeatPort)));
+        rawLogsPort = Integer.parseInt(prop.getProperty("rawLogsPort", String.valueOf(rawLogsPort)));
         logsIngestionConfigFile = prop.getProperty("logsIngestionConfigFile", logsIngestionConfigFile);
+
+        /*
+          default value for pushMemoryBufferLimit is 16 * pushFlushMaxPoints, but no more than 25% of available heap
+          memory. 25% is chosen heuristically as a safe number for scenarios with limited system resources (4 CPU cores
+          or less, heap size less than 4GB) to prevent OOM. this is a conservative estimate, budgeting 200 characters
+          (400 bytes) per per point line. Also, it shouldn't be less than 1 batch size (pushFlushMaxPoints).
+         */
+        int listeningPorts = Iterables.size(Splitter.on(",").omitEmptyStrings().trimResults().split(pushListenerPorts));
+        long calculatedMemoryBufferLimit = Math.max(Math.min(16 * pushFlushMaxPoints,
+            Runtime.getRuntime().maxMemory() / listeningPorts / 4 / flushThreads / 400), pushFlushMaxPoints);
+        logger.fine("Calculated pushMemoryBufferLimit: " + calculatedMemoryBufferLimit);
+        pushMemoryBufferLimit = Integer.parseInt(prop.getProperty("pushMemoryBufferLimit",
+            String.valueOf(calculatedMemoryBufferLimit)));
+        logger.fine("Configured pushMemoryBufferLimit: " + pushMemoryBufferLimit);
+
         logger.warning("Loaded configuration file " + pushConfigFile);
       } catch (Throwable exception) {
         logger.severe("Could not load configuration file " + pushConfigFile);
@@ -597,9 +651,32 @@ public abstract class AbstractAgent {
 
       initPreprocessors();
 
+      if (pushRateLimit > 0) {
+        pushRateLimiter = RecyclableRateLimiter.create(pushRateLimit, 60);
+      }
       PostPushDataTimedTask.setPointsPerBatch(pushFlushMaxPoints);
+      PostPushDataTimedTask.setMemoryBufferLimit(pushMemoryBufferLimit);
       QueuedAgentService.setSplitBatchSize(pushFlushMaxPoints);
       QueuedAgentService.setRetryBackoffBaseSeconds(retryBackoffBaseSeconds);
+
+      // for backwards compatibility - if pushLogLevel is defined in the config file, change log level programmatically
+      Level level = null;
+      switch (pushLogLevel) {
+        case "NONE":
+          level = Level.WARNING;
+          break;
+        case "SUMMARY":
+          level = Level.INFO;
+          break;
+        case "DETAILED":
+          level = Level.FINE;
+          break;
+      }
+      if (level != null) {
+        Logger.getLogger("agent").setLevel(level);
+        Logger.getLogger(PostPushDataTimedTask.class.getCanonicalName()).setLevel(level);
+        Logger.getLogger(QueuedAgentService.class.getCanonicalName()).setLevel(level);
+      }
     }
   }
 
@@ -610,6 +687,10 @@ public abstract class AbstractAgent {
    */
   public void start(String[] args) throws IOException {
     try {
+      // read build information and print version.
+      props = ResourceBundle.getBundle("build");
+      logger.info("Starting proxy version " + props.getString("build.version"));
+
       logger.info("Arguments: " + Joiner.on(", ").join(args));
       new JCommander(this, args);
       if (unparsed_params != null) {
@@ -626,10 +707,6 @@ public abstract class AbstractAgent {
 
       // 2. Read or create the unique Id for the daemon running on this machine.
       readOrCreateDaemonId();
-
-      // read build information and print version.
-      props = ResourceBundle.getBundle("build");
-      logger.info("Starting proxy version " + props.getString("build.version"));
 
       if (proxyHost != null) {
         System.setProperty("http.proxyHost", proxyHost);
@@ -697,14 +774,6 @@ public abstract class AbstractAgent {
         config = fetchConfig();
         logger.info("scheduling regular configuration polls");
         auxiliaryExecutor.schedule(updateConfiguration, 10, TimeUnit.SECONDS);
-
-        URI url = URI.create(server);
-        if (url.getPath().endsWith("/api/")) {
-          String configurationLogMessage = "TO CONFIGURE THIS PROXY AGENT, USE THIS KEY: " + agentId;
-          logger.warning(Strings.repeat("*", configurationLogMessage.length()));
-          logger.warning(configurationLogMessage);
-          logger.warning(Strings.repeat("*", configurationLogMessage.length()));
-        }
       }
       // 6. Setup work units and targets based on the configuration.
       if (config != null) {
@@ -724,7 +793,9 @@ public abstract class AbstractAgent {
   protected AgentAPI createAgentService() {
     ResteasyProviderFactory factory = ResteasyProviderFactory.getInstance();
     factory.registerProvider(JsonNodeWriter.class);
-    factory.registerProvider(ResteasyJacksonProvider.class);
+    if (!factory.getClasses().contains(ResteasyJacksonProvider.class)) {
+      factory.registerProvider(ResteasyJacksonProvider.class);
+    }
     if (httpUserAgent == null) {
       httpUserAgent = "Wavefront-Proxy/" + props.getString("build.version");
     }
@@ -750,6 +821,7 @@ public abstract class AbstractAgent {
     } else {
       HttpClient httpClient = HttpClientBuilder.create().
           useSystemProperties().
+          disableAutomaticRetries().
           setUserAgent(httpUserAgent).
           setMaxConnTotal(200).
           setMaxConnPerRoute(100).
@@ -794,7 +866,7 @@ public abstract class AbstractAgent {
             toReturn.setName("submission worker: " + counter.getAndIncrement());
             return toReturn;
           }
-        }), purgeBuffer, agentId, splitPushWhenRateLimited, pushLogLevel);
+        }), purgeBuffer, agentId, splitPushWhenRateLimited, pushRateLimiter);
   }
 
   /**
@@ -853,28 +925,44 @@ public abstract class AbstractAgent {
     }
   }
 
+  private void fetchConfigError(String errMsg, @Nullable String secondErrMsg) {
+    logger.severe(Strings.repeat("*", errMsg.length()));
+    logger.severe(errMsg);
+    if (secondErrMsg != null) {
+      logger.severe(secondErrMsg);
+    }
+    logger.severe(Strings.repeat("*", errMsg.length()));
+  }
+
   /**
    * Fetch configuration of the daemon from remote server.
    *
    * @return Fetched configuration. {@code null} if the configuration is invalid.
    */
   private AgentConfiguration fetchConfig() {
-    AgentConfiguration newConfig;
+    AgentConfiguration newConfig = null;
+    logger.info("fetching configuration from server at: " + server);
+    long maxAvailableSpace = 0;
     try {
-      logger.info("fetching configuration from server at: " + server);
-      File buffer = new File(bufferFile).getAbsoluteFile();
-      try {
-        while (buffer != null && buffer.getUsableSpace() == 0) {
-          buffer = buffer.getParentFile();
-        }
-        if (buffer != null) {
-          // the amount of space is limited by the number of retryThreads.
-          bufferSpaceLeft.set(Math.min((long) Integer.MAX_VALUE * retryThreads, buffer.getUsableSpace()));
-        }
-      } catch (Throwable t) {
-        logger.warning("cannot compute remaining space in buffer file partition: " + t);
+      File bufferDirectory = new File(bufferFile).getAbsoluteFile();
+      while (bufferDirectory != null && bufferDirectory.getUsableSpace() == 0) {
+        bufferDirectory = bufferDirectory.getParentFile();
       }
+      for (int i = 0; i < retryThreads; i++) {
+        File buffer = new File(bufferFile + "." + i);
+        if (buffer.exists()) {
+          maxAvailableSpace += Integer.MAX_VALUE - buffer.length(); // 2GB max file size minus size used
+        }
+      }
+      if (bufferDirectory != null) {
+        // lesser of: available disk space or available buffer space
+        bufferSpaceLeft.set(Math.min(maxAvailableSpace, bufferDirectory.getUsableSpace()));
+      }
+    } catch (Throwable t) {
+      logger.warning("cannot compute remaining space in buffer file partition: " + t);
+    }
 
+    try {
       @Nullable Map<String, String> pointTags = null;
       if (agentMetricsPointTags != null) {
         pointTags = Splitter.on(",").withKeyValueSeparator("=").split(agentMetricsPointTags);
@@ -883,8 +971,39 @@ public abstract class AbstractAgent {
           true, true, true, pointTags);
       newConfig = agentAPI.checkin(agentId, hostname, token, props.getString("build.version"),
           System.currentTimeMillis(), localAgent, agentMetrics, pushAgent, ephemeral);
+    } catch (NotAuthorizedException ex) {
+      fetchConfigError("HTTP 401 Unauthorized: Please verify that your server and token settings",
+          "are correct and that the token has Agent Management permission!");
+      return null;
+    } catch (ClientErrorException ex) {
+      if (ex.getResponse().getStatus() == 407) {
+        fetchConfigError("HTTP 407 Proxy Authentication Required: Please verify that proxyUser and proxyPassword",
+            "settings are correct and make sure your HTTP proxy is not rate limiting!");
+        return null;
+      }
+      if (ex.getResponse().getStatus() == 404) {
+        fetchConfigError("HTTP 404 Not Found: Please verify that your server setting is correct: " + server, null);
+        return null;
+      }
+      fetchConfigError("HTTP " + ex.getResponse().getStatus() + " error: Unable to retrieve proxy agent configuration!",
+          server + ": " + Throwables.getRootCause(ex).getMessage());
+      return null;
+    } catch (ProcessingException ex) {
+      if (Throwables.getRootCause(ex) instanceof UnknownHostException) {
+        fetchConfigError("Unknown host: " + server + ". Please verify your DNS and network settings!", null);
+        return null;
+      }
+      if (Throwables.getRootCause(ex) instanceof ConnectException) {
+        fetchConfigError("Unable to connect to " + server + ": " + Throwables.getRootCause(ex).getMessage(),
+            "Please verify your network/firewall settings!");
+        return null;
+      }
+      fetchConfigError("Request processing error: Unable to retrieve proxy agent configuration!",
+          server + ": " + Throwables.getRootCause(ex));
+      return null;
     } catch (Exception ex) {
-      logger.warning("cannot fetch proxy agent configuration from remote server: " + Throwables.getRootCause(ex));
+      fetchConfigError("Unable to retrieve proxy agent configuration from remote server!",
+          server + ": " + Throwables.getRootCause(ex));
       return null;
     }
     if (newConfig.currentTime != null) {
@@ -912,13 +1031,9 @@ public abstract class AbstractAgent {
     PostPushDataTimedTask[] toReturn = new PostPushDataTimedTask[flushThreads];
     logger.info("Using " + flushThreads + " flush threads to send batched " + pushFormat +
         " data to Wavefront for data received on port: " + handle);
-    ScheduledExecutorService es = Executors.newScheduledThreadPool(flushThreads);
-    managedExecutors.add(es);
     for (int i = 0; i < flushThreads; i++) {
       final PostPushDataTimedTask postPushDataTimedTask =
-          new PostPushDataTimedTask(pushFormat, agentAPI, pushLogLevel, agentId, handle, i);
-      es.scheduleWithFixedDelay(postPushDataTimedTask, pushFlushInterval, pushFlushInterval,
-          TimeUnit.MILLISECONDS);
+          new PostPushDataTimedTask(pushFormat, agentAPI, agentId, handle, i, pushRateLimiter, pushFlushInterval);
       toReturn[i] = postPushDataTimedTask;
       managedTasks.add(postPushDataTimedTask);
     }
@@ -944,9 +1059,7 @@ public abstract class AbstractAgent {
     logger.info("Shutting down: Stopping schedulers...");
     agentAPI.shutdown();
     auxiliaryExecutor.shutdown();
-    for (ScheduledExecutorService executor : managedExecutors) {
-      executor.shutdown();
-    }
+    managedTasks.forEach(PostPushDataTimedTask::shutdown);
     logger.info("Shutting down: Flushing pending points...");
     for (PostPushDataTimedTask task : managedTasks) {
       while (task.getNumPointsToSend() > 0)
@@ -956,27 +1069,33 @@ public abstract class AbstractAgent {
   }
 
   private static String getLocalHostName() {
+    InetAddress localAddress = null;
     try {
-      return InetAddress.getLocalHost().getCanonicalHostName();
-    } catch (UnknownHostException e) {
-      try {
-        // if can't resolve local server name, use a real IPv4 address from the first available network interface
-        for (Enumeration<NetworkInterface> nics = NetworkInterface.getNetworkInterfaces();
-             nics.hasMoreElements(); ) {
-          NetworkInterface network = nics.nextElement();
-          if (!network.isUp() || network.isLoopback())
+      Enumeration<NetworkInterface> nics = NetworkInterface.getNetworkInterfaces();
+      while (nics.hasMoreElements()) {
+        NetworkInterface network = nics.nextElement();
+        if (!network.isUp() || network.isLoopback()) {
+          continue;
+        }
+        for (Enumeration<InetAddress> addresses = network.getInetAddresses(); addresses.hasMoreElements(); ) {
+          InetAddress address = addresses.nextElement();
+          if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isMulticastAddress()) {
             continue;
-          for (Enumeration<InetAddress> addresses = network.getInetAddresses(); addresses.hasMoreElements(); ) {
-            InetAddress address = addresses.nextElement();
-            if (address.isAnyLocalAddress() || address.isLoopbackAddress() ||
-                address.isMulticastAddress() || !(address instanceof Inet4Address))
-              continue;
-            return (address.getHostAddress());
+          }
+          if (address instanceof Inet4Address) { // prefer ipv4
+            localAddress = address;
+            break;
+          }
+          if (localAddress == null) {
+            localAddress = address;
           }
         }
-      } catch (SocketException ex) {
-        // ignore and simply return "localhost"
       }
+    } catch (SocketException ex) {
+      // ignore
+    }
+    if (localAddress != null) {
+      return localAddress.getCanonicalHostName();
     }
     return "localhost";
   }

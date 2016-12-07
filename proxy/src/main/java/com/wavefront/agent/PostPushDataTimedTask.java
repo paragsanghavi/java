@@ -1,6 +1,7 @@
 package com.wavefront.agent;
 
 import com.google.common.util.concurrent.RateLimiter;
+import com.google.common.util.concurrent.RecyclableRateLimiter;
 
 import com.wavefront.agent.api.ForceQueueEnabledAgentAPI;
 import com.wavefront.api.agent.Constants;
@@ -14,6 +15,8 @@ import com.yammer.metrics.core.TimerContext;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -28,12 +31,6 @@ public class PostPushDataTimedTask implements Runnable {
   private static final Logger logger = Logger.getLogger(PostPushDataTimedTask.class.getCanonicalName());
 
   private static final int MAX_SPLIT_BATCH_SIZE = 50000; // same value as default pushFlushMaxPoints
-  private static long INTERVALS_PER_SUMMARY = 60;
-
-  // TODO: enum
-  public static final String LOG_NONE = "NONE";
-  public static final String LOG_SUMMARY = "SUMMARY";
-  public static final String LOG_DETAILED = "DETAILED";
 
   private List<String> points = new ArrayList<>();
   private final Object pointsMutex = new Object();
@@ -42,22 +39,41 @@ public class PostPushDataTimedTask implements Runnable {
   private final String pushFormat;
   private final Object blockedSamplesMutex = new Object();
 
-  private RateLimiter warningMessageRateLimiter = RateLimiter.create(0.2);
+  /**
+   * Warn about exceeding the rate limit no more than once per 10 seconds (per thread)
+   */
+  private final RateLimiter warningMessageRateLimiter = RateLimiter.create(0.1);
+
+  /**
+   * Print summary once a minute
+   */
+  private final RateLimiter summaryMessageRateLimiter = RateLimiter.create(0.017);
+
+  /**
+   * Write a sample of blocked points to log once a minute
+   */
+  private final RateLimiter blockedSamplesRateLimiter = RateLimiter.create(0.017);
+  private final RecyclableRateLimiter pushRateLimiter;
 
   private final Counter pointsReceived;
   private final Counter pointsAttempted;
   private final Counter pointsQueued;
   private final Counter pointsBlocked;
-  private final Counter batchesSent;
+  private final Counter permitsGranted;
+  private final Counter permitsDenied;
+  private final Counter permitsRetried;
+  private final Counter batchesAttempted;
   private final Timer batchSendTime;
 
-  private long numIntervals = 0;
   private long numApiCalls = 0;
 
   private UUID daemonId;
   private String handle;
+  private final int threadId;
+  private long pushFlushInterval;
+  private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
   private static int pointsPerBatch = MAX_SPLIT_BATCH_SIZE;
-  private String logLevel;
+  private static int memoryBufferLimit = MAX_SPLIT_BATCH_SIZE * 32;
   private boolean isFlushingToQueue = false;
 
   private ForceQueueEnabledAgentAPI agentAPI;
@@ -65,6 +81,10 @@ public class PostPushDataTimedTask implements Runnable {
   static void setPointsPerBatch(int newSize) {
     pointsPerBatch = Math.min(newSize, MAX_SPLIT_BATCH_SIZE);
     pointsPerBatch = Math.max(pointsPerBatch, 1);
+  }
+
+  static void setMemoryBufferLimit(int newSize) {
+    memoryBufferLimit = Math.max(newSize, pointsPerBatch);
   }
 
   public void addPoint(String metricString) {
@@ -121,31 +141,50 @@ public class PostPushDataTimedTask implements Runnable {
     return daemonId;
   }
 
+  @Deprecated
   public PostPushDataTimedTask(String pushFormat, ForceQueueEnabledAgentAPI agentAPI, String logLevel,
-                               UUID daemonId, String handle, int threadId) {
+                               UUID daemonId, String handle, int threadId, RecyclableRateLimiter pushRateLimiter,
+                               long pushFlushInterval) {
+    this(pushFormat, agentAPI, daemonId, handle, threadId, pushRateLimiter, pushFlushInterval);
+  }
+
+  public PostPushDataTimedTask(String pushFormat, ForceQueueEnabledAgentAPI agentAPI,
+                               UUID daemonId, String handle, int threadId, RecyclableRateLimiter pushRateLimiter,
+                               long pushFlushInterval) {
     this.pushFormat = pushFormat;
-    this.logLevel = logLevel;
     this.daemonId = daemonId;
     this.handle = handle;
+    this.threadId = threadId;
+    this.pushFlushInterval = pushFlushInterval;
     this.agentAPI = agentAPI;
+    this.pushRateLimiter = pushRateLimiter;
 
     this.pointsAttempted = Metrics.newCounter(new MetricName("points." + handle, "", "sent"));
     this.pointsQueued = Metrics.newCounter(new MetricName("points." + handle, "", "queued"));
     this.pointsBlocked = Metrics.newCounter(new MetricName("points." + handle, "", "blocked"));
     this.pointsReceived = Metrics.newCounter(new MetricName("points." + handle, "", "received"));
-    this.batchesSent = Metrics.newCounter(
+    this.permitsGranted = Metrics.newCounter(new MetricName("limiter", "", "permits-granted"));
+    this.permitsDenied = Metrics.newCounter(new MetricName("limiter", "", "permits-denied"));
+    this.permitsRetried = Metrics.newCounter(new MetricName("limiter", "", "permits-retried"));
+    this.batchesAttempted = Metrics.newCounter(
         new MetricName("push." + String.valueOf(handle) + ".thread-" + String.valueOf(threadId), "", "batches"));
     this.batchSendTime = Metrics.newTimer(new MetricName("push." + handle, "", "duration"),
         TimeUnit.MILLISECONDS, TimeUnit.MINUTES);
+    this.scheduler.schedule(this, pushFlushInterval, TimeUnit.MILLISECONDS);
   }
 
   @Override
   public void run() {
+    long nextRunMillis = this.pushFlushInterval;
     try {
       List<String> current = createAgentPostBatch();
-      batchesSent.inc();
+      batchesAttempted.inc();
+      if (current.size() == 0) {
+        return;
+      }
+      if (pushRateLimiter == null || pushRateLimiter.tryAcquire(current.size())) {
+        if (pushRateLimiter != null) this.permitsGranted.inc(current.size());
 
-      if (current.size() != 0) {
         TimerContext timerContext = this.batchSendTime.time();
         Response response = null;
         try {
@@ -158,6 +197,10 @@ public class PostPushDataTimedTask implements Runnable {
           int pointsInList = current.size();
           this.pointsAttempted.inc(pointsInList);
           if (response.getStatus() == Response.Status.NOT_ACCEPTABLE.getStatusCode()) {
+            if (pushRateLimiter != null) {
+              this.pushRateLimiter.recyclePermits(pointsInList);
+              this.permitsRetried.inc(pointsInList);
+            }
             this.pointsQueued.inc(pointsInList);
           }
         } finally {
@@ -166,21 +209,40 @@ public class PostPushDataTimedTask implements Runnable {
           if (response != null) response.close();
         }
 
-        if (points.size() > getQueuedPointLimit()) {
-          if (warningMessageRateLimiter.tryAcquire()) {
-            logger.warning("WF-3 Too many pending points (" + points.size() + "), block size: " +
-                pointsPerBatch + ". flushing to retry queue");
-          }
-
+        if (points.size() > memoryBufferLimit) {
           // there are going to be too many points to be able to flush w/o the agent blowing up
           // drain the leftovers straight to the retry queue (i.e. to disk)
           // don't let anyone add any more to points while we're draining it.
+          logger.warning("[FLUSH THREAD " + threadId + "]: WF-3 Too many pending points (" + points.size() +
+              "), block size: " + pointsPerBatch + ". flushing to retry queue");
           drainBuffersToQueue();
+          logger.info("[FLUSH THREAD " + threadId + "]: flushing to retry queue complete. " +
+              "Pending points: " + points.size());
+        }
+      } else {
+        this.permitsDenied.inc(current.size());
+        // if proxy rate limit exceeded, try again in 250..500ms (to introduce some degree of fairness)
+        nextRunMillis = 250 + (int) (Math.random() * 250);
+        if (warningMessageRateLimiter.tryAcquire()) {
+          logger.warning("[FLUSH THREAD " + threadId + "]: WF-4 Proxy rate limit exceeded " +
+              "(pending points: " + points.size() + "), will retry");
+        }
+        synchronized (pointsMutex) { // return the batch to the beginning of the queue
+          points.addAll(0, current);
         }
       }
     } catch (Throwable t) {
       logger.log(Level.SEVERE, "Unexpected error in flush loop", t);
+    } finally {
+      scheduler.schedule(this, nextRunMillis, TimeUnit.MILLISECONDS);
     }
+  }
+
+  /**
+   * Shut down the scheduler for this task (prevent future scheduled runs)
+   */
+  public void shutdown() {
+    scheduler.shutdown();
   }
 
   public void drainBuffersToQueue() {
@@ -200,6 +262,9 @@ public class PostPushDataTimedTask implements Runnable {
           // update the counters as if this was a failed call to the API
           this.pointsAttempted.inc(pushDataPointCount);
           this.pointsQueued.inc(pushDataPointCount);
+          if (pushRateLimiter != null) {
+            this.permitsDenied.inc(pushDataPointCount);
+          }
           numApiCalls++;
           pointsToFlush -= pushDataPointCount;
         } else {
@@ -211,47 +276,40 @@ public class PostPushDataTimedTask implements Runnable {
     }
   }
 
+  private void logBlockedPoints() {
+    if (blockedSamplesRateLimiter.tryAcquire()) {
+      List<String> currentBlockedSamples = new ArrayList<>();
+      if (!blockedSamples.isEmpty()) {
+        synchronized (blockedSamplesMutex) {
+          // Copy this to a temp structure that we can iterate over for printing below
+          currentBlockedSamples.addAll(blockedSamples);
+          blockedSamples.clear();
+        }
+      }
+      for (String blockedLine : currentBlockedSamples) {
+        logger.info("[" + handle + "] blocked input: [" + blockedLine + "]");
+      }
+    }
+  }
+
   private List<String> createAgentPostBatch() {
     List<String> current;
-    List<String> currentBlockedSamples = null;
     int blockSize;
     synchronized (pointsMutex) {
       blockSize = Math.min(points.size(), pointsPerBatch);
       current = points.subList(0, blockSize);
-
-      numIntervals += 1;
       points = new ArrayList<>(points.subList(blockSize, points.size()));
     }
-    if (((numIntervals % INTERVALS_PER_SUMMARY) == 0) && !blockedSamples.isEmpty()) {
-      synchronized (blockedSamplesMutex) {
-        // Copy this to a temp structure that we can iterate over for printing below
-        if ((!logLevel.equals(LOG_NONE))) {
-          currentBlockedSamples = new ArrayList<>(blockedSamples);
-        }
-        blockedSamples.clear();
-      }
-    }
-
-    if (logLevel.equals(LOG_DETAILED)) {
-      logger.warning("[" + handle + "] (DETAILED): sending " + current.size() + " valid points; " +
-          "queue size:" + points.size() + "; total attempted points: " +
-          getAttemptedPoints() + "; total blocked: " + this.pointsBlocked.count());
-    }
-    if (((numIntervals % INTERVALS_PER_SUMMARY) == 0) && (!logLevel.equals(LOG_NONE))) {
-      logger.warning("[" + handle + "] (SUMMARY): points attempted: " + getAttemptedPoints() +
+    if (summaryMessageRateLimiter.tryAcquire()) {
+      logger.info("[" + handle + "] (SUMMARY): points attempted: " + getAttemptedPoints() +
           "; blocked: " + this.pointsBlocked.count());
-      if (currentBlockedSamples != null) {
-        for (String blockedLine : currentBlockedSamples) {
-          logger.warning("[" + handle + "] blocked input: [" + blockedLine + "]");
-        }
-      }
     }
+    logBlockedPoints();
+    logger.fine("[" + handle + "] (DETAILED): sending " + current.size() + " valid points" +
+        "; points in memory: " + points.size() +
+        "; total attempted points: " + getAttemptedPoints() +
+        "; total blocked: " + this.pointsBlocked.count() +
+        "; total queued: " + getNumPointsQueued());
     return current;
-  }
-
-
-  private long getQueuedPointLimit() {
-    // if there's more than 2 batches worth of points, that's going to be too much
-    return pointsPerBatch * Runtime.getRuntime().availableProcessors() * 2;
   }
 }

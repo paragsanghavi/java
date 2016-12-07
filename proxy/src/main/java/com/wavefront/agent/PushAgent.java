@@ -10,7 +10,6 @@ import com.squareup.tape.ObjectQueue;
 import com.tdunning.math.stats.AgentDigest;
 import com.tdunning.math.stats.AgentDigest.AgentDigestMarshaller;
 import com.wavefront.agent.config.ConfigurationException;
-import com.wavefront.agent.config.LogsIngestionConfig;
 import com.wavefront.agent.formatter.GraphiteFormatter;
 import com.wavefront.agent.histogram.HistogramLineIngester;
 import com.wavefront.agent.histogram.MapLoader;
@@ -23,7 +22,9 @@ import com.wavefront.agent.histogram.accumulator.AccumulationCache;
 import com.wavefront.agent.histogram.accumulator.AccumulationTask;
 import com.wavefront.agent.histogram.tape.TapeDeck;
 import com.wavefront.agent.histogram.tape.TapeStringListConverter;
-import com.wavefront.agent.logsharvesting.FilebeatListener;
+import com.wavefront.agent.logsharvesting.FilebeatIngester;
+import com.wavefront.agent.logsharvesting.LogsIngester;
+import com.wavefront.agent.logsharvesting.RawLogsIngester;
 import com.wavefront.agent.preprocessor.PointPreprocessor;
 import com.wavefront.agent.preprocessor.ReportPointAddPrefixTransformer;
 import com.wavefront.agent.preprocessor.ReportPointTimestampInRangeFilter;
@@ -38,7 +39,6 @@ import com.wavefront.ingester.PickleProtocolDecoder;
 import com.wavefront.ingester.StreamIngester;
 import com.wavefront.ingester.StringLineIngester;
 import com.wavefront.ingester.TcpIngester;
-import com.yammer.metrics.reporting.ConsoleReporter;
 
 import org.glassfish.jersey.jackson.JacksonFeature;
 import org.glassfish.jersey.jetty.JettyHttpContainerFactory;
@@ -136,13 +136,12 @@ public class PushAgent extends AbstractAgent {
           histogramCompression = (short) Math.min(1000, (short) Math.max(20, histogramCompression));
         }
 
-        // Print metrics to console for debug purposes TODO remove
-        ConsoleReporter.enable(20L, TimeUnit.SECONDS);
-
-        // Check directory
         File baseDirectory = new File(histogramStateDirectory);
-        checkArgument(baseDirectory.isDirectory(), baseDirectory.getAbsolutePath() + " must be a directory!");
-        checkArgument(baseDirectory.canWrite(), baseDirectory.getAbsolutePath() + " must be write-able!");
+        if (persistMessages || persistAccumulator) {
+          // Check directory
+          checkArgument(baseDirectory.isDirectory(), baseDirectory.getAbsolutePath() + " must be a directory!");
+          checkArgument(baseDirectory.canWrite(), baseDirectory.getAbsolutePath() + " must be write-able!");
+        }
 
         // Accumulator
         MapLoader<HistogramKey, AgentDigest, HistogramKeyMarshaller, AgentDigestMarshaller> mapLoader = new MapLoader<>(
@@ -152,7 +151,8 @@ public class PushAgent extends AbstractAgent {
             avgHistogramKeyBytes,
             avgHistogramDigestBytes,
             HistogramKeyMarshaller.get(),
-            AgentDigestMarshaller.get());
+            AgentDigestMarshaller.get(),
+            persistAccumulator);
 
         File accumulationFile = new File(baseDirectory, "accumulator");
         ConcurrentMap<HistogramKey, AgentDigest> accumulator = mapLoader.get(accumulationFile);
@@ -176,7 +176,7 @@ public class PushAgent extends AbstractAgent {
         histogramExecutor.scheduleWithFixedDelay(dispatchTask, 100L, 1L, TimeUnit.MICROSECONDS);
 
         // Input queue factory
-        TapeDeck<List<String>> accumulatorDeck = new TapeDeck<>(TapeStringListConverter.get());
+        TapeDeck<List<String>> accumulatorDeck = new TapeDeck<>(TapeStringListConverter.get(), persistMessages);
 
         // Decoders
         Decoder<String> sampleDecoder = new GraphiteDecoder("unknown", customSourceTags);
@@ -192,7 +192,7 @@ public class PushAgent extends AbstractAgent {
               baseDirectory,
               Utils.Granularity.MINUTE,
               accumulatorDeck,
-              TimeUnit.SECONDS.toMillis(histogramMinuteAccumulationInterval),
+              TimeUnit.SECONDS.toMillis(histogramMinuteFlushSecs),
               histogramMinuteAccumulators
           );
           logger.info("listening on port: " + port + " for histogram samples, accumulating to the minute");
@@ -208,7 +208,7 @@ public class PushAgent extends AbstractAgent {
               baseDirectory,
               Utils.Granularity.HOUR,
               accumulatorDeck,
-              TimeUnit.SECONDS.toMillis(histogramHourAccumulationInterval),
+              TimeUnit.SECONDS.toMillis(histogramHourFlushSecs),
               histogramHourAccumulators
           );
           logger.info("listening on port: " + port + " for histogram samples, accumulating to the hour");
@@ -224,7 +224,7 @@ public class PushAgent extends AbstractAgent {
               baseDirectory,
               Utils.Granularity.DAY,
               accumulatorDeck,
-              TimeUnit.SECONDS.toMillis(histogramDayAccumulationInterval),
+              TimeUnit.SECONDS.toMillis(histogramDayFlushSecs),
               histogramDayAccumulators
           );
           logger.info("listening on port: " + port + " for histogram samples, accumulating to the day");
@@ -240,7 +240,7 @@ public class PushAgent extends AbstractAgent {
               baseDirectory,
               Utils.Granularity.DAY, // Ignored...
               accumulatorDeck,
-              TimeUnit.SECONDS.toMillis(histogramDistAccumulationInterval),
+              TimeUnit.SECONDS.toMillis(histogramDistFlushSecs),
               histogramDistAccumulators
           );
           logger.info("listening on port: " + port + " for histogram samples, accumulating to the day");
@@ -255,95 +255,103 @@ public class PushAgent extends AbstractAgent {
       graphiteFormatter = new GraphiteFormatter(graphiteFormat, graphiteDelimiters, graphiteFieldsToRemove);
       Iterable<String> ports = Splitter.on(",").omitEmptyStrings().trimResults().split(graphitePorts);
       for (String strPort : ports) {
-        if (strPort.trim().length() > 0) {
-          preprocessors.forPort(strPort).forPointLine().addTransformer(0, graphiteFormatter);
-          startGraphiteListener(strPort, true);
-          logger.info("listening on port: " + strPort + " for graphite metrics");
-        }
+        preprocessors.forPort(strPort).forPointLine().addTransformer(0, graphiteFormatter);
+        startGraphiteListener(strPort, true);
+        logger.info("listening on port: " + strPort + " for graphite metrics");
       }
     }
     if (opentsdbPorts != null) {
       Iterable<String> ports = Splitter.on(",").omitEmptyStrings().trimResults().split(opentsdbPorts);
       for (String strPort : ports) {
-        if (strPort.trim().length() > 0) {
-          startOpenTsdbListener(strPort);
-          logger.info("listening on port: " + strPort + " for OpenTSDB metrics");
-        }
+        startOpenTsdbListener(strPort);
+        logger.info("listening on port: " + strPort + " for OpenTSDB metrics");
       }
     }
     if (picklePorts != null) {
       Iterable<String> ports = Splitter.on(",").omitEmptyStrings().trimResults().split(picklePorts);
       for (String strPort : ports) {
-        if (strPort.trim().length() > 0) {
-          startPickleListener(strPort, graphiteFormatter);
-          logger.info("listening on port: " + strPort + " for pickle protocol metrics");
-        }
+        startPickleListener(strPort, graphiteFormatter);
+        logger.info("listening on port: " + strPort + " for pickle protocol metrics");
       }
     }
     if (httpJsonPorts != null) {
       Iterable<String> ports = Splitter.on(",").omitEmptyStrings().trimResults().split(httpJsonPorts);
       for (String strPort : ports) {
-        strPort = strPort.trim();
-        if (strPort.length() > 0) {
-          preprocessors.forPort(strPort).forReportPoint()
-              .addFilter(new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours));
-          try {
-            // will immediately start the server.
-            JettyHttpContainerFactory.createServer(
-                new URI("http://localhost:" + strPort + "/"),
-                new ResourceConfig(JacksonFeature.class).
-                    register(new JsonMetricsEndpoint(strPort, hostname, prefix,
-                        pushValidationLevel, pushBlockedSamples, getFlushTasks(strPort), preprocessors.forPort(strPort))), true);
-            logger.info("listening on port: " + strPort + " for HTTP JSON metrics");
-          } catch (URISyntaxException e) {
-            throw new RuntimeException("Unable to bind to: " + strPort + " for HTTP JSON metrics", e);
-          }
+        preprocessors.forPort(strPort).forReportPoint()
+            .addFilter(new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours));
+        try {
+          // will immediately start the server.
+          JettyHttpContainerFactory.createServer(
+              new URI("http://localhost:" + strPort + "/"),
+              new ResourceConfig(JacksonFeature.class).
+                  register(new JsonMetricsEndpoint(strPort, hostname, prefix,
+                      pushValidationLevel, pushBlockedSamples, getFlushTasks(strPort), preprocessors.forPort(strPort))),
+              true);
+          logger.info("listening on port: " + strPort + " for HTTP JSON metrics");
+        } catch (URISyntaxException e) {
+          throw new RuntimeException("Unable to bind to: " + strPort + " for HTTP JSON metrics", e);
         }
       }
     }
     if (writeHttpJsonPorts != null) {
       Iterable<String> ports = Splitter.on(",").omitEmptyStrings().trimResults().split(writeHttpJsonPorts);
       for (String strPort : ports) {
-        strPort = strPort.trim();
-        if (strPort.length() > 0) {
-          preprocessors.forPort(strPort).forReportPoint()
-              .addFilter(new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours));
+        preprocessors.forPort(strPort).forReportPoint()
+            .addFilter(new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours));
 
-          try {
-            // will immediately start the server.
-            JettyHttpContainerFactory.createServer(
-                new URI("http://localhost:" + strPort + "/"),
-                new ResourceConfig(JacksonFeature.class).
-                    register(new WriteHttpJsonMetricsEndpoint(strPort, hostname, prefix,
-                        pushValidationLevel, pushBlockedSamples, getFlushTasks(strPort), preprocessors.forPort(strPort))),
-                true);
-            logger.info("listening on port: " + strPort + " for Write HTTP JSON metrics");
-          } catch (URISyntaxException e) {
-            throw new RuntimeException("Unable to bind to: " + strPort + " for Write HTTP JSON metrics", e);
-          }
+        try {
+          // will immediately start the server.
+          JettyHttpContainerFactory.createServer(
+              new URI("http://localhost:" + strPort + "/"),
+              new ResourceConfig(JacksonFeature.class).
+                  register(new WriteHttpJsonMetricsEndpoint(strPort, hostname, prefix,
+                      pushValidationLevel, pushBlockedSamples, getFlushTasks(strPort), preprocessors.forPort(strPort))),
+              true);
+          logger.info("listening on port: " + strPort + " for Write HTTP JSON metrics");
+        } catch (URISyntaxException e) {
+          throw new RuntimeException("Unable to bind to: " + strPort + " for Write HTTP JSON metrics", e);
         }
       }
     }
 
-    if (filebeatPort > 0) {
+    // Logs ingestion.
+    if (loadLogsIngestionConfig() != null) {
+      logger.info("Loading logs ingestion.");
       try {
-        final Server filebeatServer = new Server(filebeatPort);
-        final String filebeatPortStr = String.valueOf(filebeatPort);
-        filebeatServer.setMessageListener(new FilebeatListener(
+        final LogsIngester logsIngester = new LogsIngester(
             new PointHandlerImpl(
-                filebeatPortStr, pushValidationLevel, pushBlockedSamples, getFlushTasks(filebeatPortStr)),
-            this::loadLogsIngestionConfig, prefix, System::currentTimeMillis));
-        startAsManagedThread(() -> {
-          try {
-            filebeatServer.listen();
-          } catch (InterruptedException e) {
-            e.printStackTrace();
-          }
-        });
+                "logs-ingester", pushValidationLevel, pushBlockedSamples, getFlushTasks("logs-ingester")),
+            this::loadLogsIngestionConfig, prefix, System::currentTimeMillis);
+
+        if (filebeatPort > 0) {
+          final Server filebeatServer = new Server(filebeatPort);
+          filebeatServer.setMessageListener(new FilebeatIngester(logsIngester, System::currentTimeMillis));
+          startAsManagedThread(() -> {
+            try {
+              filebeatServer.listen();
+            } catch (InterruptedException e) {
+              logger.log(Level.SEVERE, "Filebeat server interrupted.", e);
+            }
+          });
+        }
+
+        if (rawLogsPort > 0) {
+          RawLogsIngester rawLogsIngester = new RawLogsIngester(logsIngester, rawLogsPort, System::currentTimeMillis);
+          startAsManagedThread(() -> {
+            try {
+              rawLogsIngester.listen();
+            } catch (InterruptedException e) {
+              logger.log(Level.SEVERE, "Raw logs server interrupted.", e);
+            }
+          });
+        }
       } catch (ConfigurationException e) {
         logger.log(Level.SEVERE, "Cannot start logsIngestion", e);
       }
+    } else {
+      logger.info("Not loading logs ingestion -- no config specified.");
     }
+
   }
 
   protected void startOpenTsdbListener(final String strPort) {
@@ -511,17 +519,13 @@ public class PushAgent extends AbstractAgent {
           // if the collector is in charge and it provided a setting, use it
           QueuedAgentService.setSplitBatchSize(pointsPerBatch.intValue());
           PostPushDataTimedTask.setPointsPerBatch(pointsPerBatch.intValue());
-          if (pushLogLevel.equals("DETAILED")) {
-            logger.info("Agent push batch set to (remotely) " + pointsPerBatch);
-          }
+          logger.fine("Agent push batch set to (remotely) " + pointsPerBatch);
         } // otherwise don't change the setting
       } else {
         // restores the agent setting
         QueuedAgentService.setSplitBatchSize(pushFlushMaxPoints);
         PostPushDataTimedTask.setPointsPerBatch(pushFlushMaxPoints);
-        if (pushLogLevel.equals("DETAILED")) {
-          logger.info("Agent push batch set to (locally) " + pushFlushMaxPoints);
-        }
+        logger.fine("Agent push batch set to (locally) " + pushFlushMaxPoints);
       }
 
       if (config.getCollectorSetsRetryBackoff() != null &&
@@ -529,17 +533,13 @@ public class PushAgent extends AbstractAgent {
         if (config.getRetryBackoffBaseSeconds() != null) {
           // if the collector is in charge and it provided a setting, use it
           QueuedAgentService.setRetryBackoffBaseSeconds(config.getRetryBackoffBaseSeconds());
-          if (pushLogLevel.equals("DETAILED")) {
-            logger.info("Agent backoff base set to (remotely) " +
+          logger.fine("Agent backoff base set to (remotely) " +
                 config.getRetryBackoffBaseSeconds());
-          }
         } // otherwise don't change the setting
       } else {
         // restores the agent setting
         QueuedAgentService.setRetryBackoffBaseSeconds(retryBackoffBaseSeconds);
-        if (pushLogLevel.equals("DETAILED")) {
-          logger.info("Agent backoff base set to (locally) " + retryBackoffBaseSeconds);
-        }
+        logger.fine("Agent backoff base set to (locally) " + retryBackoffBaseSeconds);
       }
     } catch (RuntimeException e) {
       // cannot throw or else configuration update thread would die.
